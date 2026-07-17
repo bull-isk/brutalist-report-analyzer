@@ -214,138 +214,474 @@ class BrutalistReportScraper:
         Extract the main image from a news article.
         Improved version with better meta tag handling and faster processing.
         """
-        try:
-            # Simplified headers - many sites block overly complex user agents
-            headers = {
-                'User-Agent': 'Mozilla/5.0 (compatible; NewsBot/1.0)',
-                'Accept': 'text/html,application/xhtml+xml',
-                'Accept-Language': 'en-US,en;q=0.5',
-            }
-            
-            response = requests.get(article_url, headers=headers, timeout=8)
-            response.raise_for_status()
-            
-            soup = BeautifulSoup(response.text, 'html.parser')
-            
-            # Strategy 1: Meta tags (most reliable for news sites)
-            # Open Graph image - highest priority
-            og_image = soup.find('meta', property='og:image')
-            if og_image and og_image.get('content'):
-                img_url = og_image['content']
+        for attempt in range(max_retries):
+            try:
+                # Better headers - more compatible with news sites
+                headers = {
+                    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+                    'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
+                    'Accept-Language': 'en-US,en;q=0.9',
+                    'Accept-Encoding': 'gzip, deflate',
+                    'DNT': '1',
+                    'Connection': 'keep-alive',
+                    'Upgrade-Insecure-Requests': '1'
+                }
+                
+                response = requests.get(article_url, headers=headers, timeout=10, allow_redirects=True)
+                response.raise_for_status()
+                
+                soup = BeautifulSoup(response.text, 'html.parser')
+                
+                # Strategy 1: Meta tags (most reliable)
+                image_result = self._extract_from_meta_tags(soup, article_url)
+                if image_result:
+                    return image_result
+                
+                # Strategy 2: JSON-LD structured data
+                image_result = self._extract_from_json_ld(soup, article_url)
+                if image_result:
+                    return image_result
+                
+                # Strategy 3: Common news site patterns
+                image_result = self._extract_from_common_patterns(soup, article_url)
+                if image_result:
+                    return image_result
+                
+                # Strategy 4: Intelligent image analysis
+                image_result = self._extract_from_content_analysis(soup, article_url)
+                if image_result:
+                    return image_result
+                
+                return None
+                
+            except requests.Timeout:
+                if attempt < max_retries - 1:
+                    continue
+                return {
+                    'error': 'Request timeout',
+                    'error_type': 'Timeout',
+                    'source_url': article_url
+                }
+            except requests.RequestException as e:
+                return {
+                    'error': str(e),
+                    'error_type': type(e).__name__,
+                    'source_url': article_url
+                }
+            except Exception as e:
+                return {
+                    'error': str(e),
+                    'error_type': 'UnexpectedError',
+                    'source_url': article_url
+                }
+        
+        return None
+    
+    def _extract_from_meta_tags(self, soup, article_url):
+        """Extract image from various meta tag formats."""
+        # Priority order of meta tags to check
+        meta_checks = [
+            # Open Graph
+            {'property': 'og:image'},
+            {'property': 'og:image:url'},
+            {'property': 'og:image:secure_url'},
+            # Twitter Card
+            {'name': 'twitter:image'},
+            {'property': 'twitter:image'},
+            {'name': 'twitter:image:src'},
+            # Other common formats
+            {'name': 'image'},
+            {'itemprop': 'image'},
+            {'name': 'thumbnail'},
+        ]
+        
+        for check in meta_checks:
+            tag = soup.find('meta', attrs=check)
+            if tag and tag.get('content'):
+                img_url = tag['content'].strip()
+                
                 if self._is_valid_image_url(img_url):
-                    # Safely get alt text
-                    og_title = soup.find('meta', property='og:title')
-                    alt_text = og_title.get('content', 'Article image') if og_title else 'Article image'
+                    # Get alt text from title tags
+                    alt_text = self._get_alt_text_from_meta(soup)
+                    
                     return {
                         'url': urljoin(article_url, img_url),
-                        'alt': alt_text[:100],
+                        'alt': alt_text,
                         'source_url': article_url
                     }
-            
-            # Twitter Card image - second priority
-            twitter_image = soup.find('meta', attrs={'name': 'twitter:image'}) or soup.find('meta', attrs={'property': 'twitter:image'})
-            if twitter_image and twitter_image.get('content'):
-                img_url = twitter_image['content']
-                if self._is_valid_image_url(img_url):
-                    # Safely get alt text
-                    twitter_title = soup.find('meta', attrs={'name': 'twitter:title'})
-                    alt_text = twitter_title.get('content', 'Article image') if twitter_title else 'Article image'
-                    return {
-                        'url': urljoin(article_url, img_url),
-                        'alt': alt_text[:100],
-                        'source_url': article_url
-                    }
-            
-            # Strategy 2: Structured data (JSON-LD)
-            json_ld_scripts = soup.find_all('script', type='application/ld+json')
-            for script in json_ld_scripts:
-                try:
-                    data = json.loads(script.string)
-                    if isinstance(data, list):
-                        data = data[0]
+        
+        return None
+    
+    def _get_alt_text_from_meta(self, soup):
+        """Get descriptive alt text from meta tags."""
+        # Try multiple meta tag sources for alt text
+        alt_sources = [
+            soup.find('meta', property='og:title'),
+            soup.find('meta', property='og:description'),
+            soup.find('meta', attrs={'name': 'twitter:title'}),
+            soup.find('meta', attrs={'name': 'description'}),
+            soup.find('title')
+        ]
+        
+        for source in alt_sources:
+            if source:
+                content = source.get('content') if hasattr(source, 'get') else source.string
+                if content:
+                    return content.strip()[:150]
+        
+        return 'Article image'
+    
+    def _extract_from_json_ld(self, soup, article_url):
+        """Extract image from JSON-LD structured data."""
+        json_ld_scripts = soup.find_all('script', type='application/ld+json')
+        
+        for script in json_ld_scripts:
+            try:
+                if not script.string:
+                    continue
+                
+                data = json.loads(script.string)
+                
+                # Handle both single objects and arrays
+                items = [data] if isinstance(data, dict) else data if isinstance(data, list) else []
+                
+                for item in items:
+                    if not isinstance(item, dict):
+                        continue
                     
                     # Look for image in various JSON-LD structures
-                    image_url = None
-                    if isinstance(data, dict):
-                        if 'image' in data:
-                            if isinstance(data['image'], str):
-                                image_url = data['image']
-                            elif isinstance(data['image'], dict) and 'url' in data['image']:
-                                image_url = data['image']['url']
-                            elif isinstance(data['image'], list) and len(data['image']) > 0:
-                                if isinstance(data['image'][0], str):
-                                    image_url = data['image'][0]
-                                elif isinstance(data['image'][0], dict) and 'url' in data['image'][0]:
-                                    image_url = data['image'][0]['url']
+                    image_url = self._extract_image_from_json_object(item)
                     
                     if image_url and self._is_valid_image_url(image_url):
+                        alt_text = item.get('headline') or item.get('name') or item.get('title') or 'Article image'
+                        
                         return {
                             'url': urljoin(article_url, image_url),
-                            'alt': data.get('headline', data.get('name', 'Article image'))[:100],
+                            'alt': str(alt_text)[:150],
                             'source_url': article_url
                         }
-                except (json.JSONDecodeError, TypeError, KeyError):
+                        
+            except (json.JSONDecodeError, TypeError, AttributeError):
+                continue
+        
+        return None
+    
+    def _extract_image_from_json_object(self, obj):
+        """Recursively extract image URL from JSON object."""
+        if not isinstance(obj, dict):
+            return None
+        
+        # Direct image field
+        if 'image' in obj:
+            img = obj['image']
+            
+            # String URL
+            if isinstance(img, str):
+                return img
+            
+            # Object with url field
+            if isinstance(img, dict):
+                if 'url' in img:
+                    return img['url']
+                if 'contentUrl' in img:
+                    return img['contentUrl']
+            
+            # Array of images
+            if isinstance(img, list) and len(img) > 0:
+                first_img = img[0]
+                if isinstance(first_img, str):
+                    return first_img
+                if isinstance(first_img, dict):
+                    return first_img.get('url') or first_img.get('contentUrl')
+        
+        # Check other common fields
+        for field in ['thumbnailUrl', 'contentUrl', 'url']:
+            if field in obj and isinstance(obj[field], str):
+                potential_url = obj[field]
+                if any(ext in potential_url.lower() for ext in ['.jpg', '.jpeg', '.png', '.webp', '.gif']):
+                    return potential_url
+        
+        return None
+    
+    def _extract_from_common_patterns(self, soup, article_url):
+        """Extract image using common news site patterns."""
+        # Priority selectors for news sites
+        selectors = [
+            # Article images
+            'article img[src]',
+            '[class*="article"] img[src]',
+            '[class*="story"] img[src]',
+            '[class*="post"] img[src]',
+            # Hero/featured images
+            '[class*="hero"] img[src]',
+            '[class*="featured"] img[src]',
+            '[class*="lead"] img[src]',
+            '[class*="main"] img[src]',
+            # Figure elements
+            'figure img[src]',
+            'picture img[src]',
+            # Content areas
+            '[class*="content"] img[src]',
+            '[id*="content"] img[src]',
+        ]
+        
+        for selector in selectors:
+            imgs = soup.select(selector)
+            
+            for img in imgs[:5]:  # Check first 5 matches
+                src = self._get_image_src(img)
+                
+                if not src or not self._is_valid_image_url(src):
                     continue
-            
-            # Strategy 3: Common news site selectors (faster than broad search)
-            priority_selectors = [
-                'article img[src]:first-of-type',
-                '.article-image img',
-                '.hero-image img',
-                '.featured-image img',
-                '.post-thumbnail img',
-                '.entry-image img',
-                'figure img',
-                '.content img:first-of-type'
-            ]
-            
-            for selector in priority_selectors:
-                img = soup.select_one(selector)
-                if img:
-                    src = img.get('src') or img.get('data-src') or img.get('data-lazy-src')
-                    alt = img.get('alt', '').strip()
-                    
-                    if src and self._is_valid_image_url(src) and len(alt) > 3:
-                        return {
-                            'url': urljoin(article_url, src),
-                            'alt': alt[:100],
-                            'source_url': article_url
-                        }
-            
-            # Strategy 4: First large image with alt text (fallback)
-            images = soup.find_all('img', alt=True, src=True)[:10]  # Limit to first 10 images
-            for img in images:
-                src = img.get('src') or img.get('data-src')
+                
+                # Get alt text
                 alt = img.get('alt', '').strip()
                 
-                if (src and alt and len(alt) > 5 and 
-                    self._is_valid_image_url(src) and 
-                    self._is_likely_content_image(src, alt)):
+                # Validate image quality
+                if self._is_content_image(src, alt, img):
+                    # Try to get better alt text from parent elements
+                    if not alt or len(alt) < 5:
+                        alt = self._get_context_alt_text(img, soup)
+                    
                     return {
                         'url': urljoin(article_url, src),
-                        'alt': alt[:100],
+                        'alt': alt[:150] if alt else 'Article image',
                         'source_url': article_url
                     }
+        
+        return None
+    
+    def _extract_from_content_analysis(self, soup, article_url):
+        """Analyze page content to find the best image."""
+        # Find main content area
+        content_areas = soup.find_all(['article', 'main', '[role="main"]'])
+        
+        if not content_areas:
+            # Fallback to common content class names
+            content_areas = soup.find_all(class_=re.compile(r'(content|article|post|story|entry)', re.I))
+        
+        candidate_images = []
+        
+        for area in content_areas[:3]:  # Check first 3 content areas
+            imgs = area.find_all('img', src=True)
             
-            return None
+            for img in imgs[:10]:  # Check first 10 images in each area
+                src = self._get_image_src(img)
+                
+                if not src or not self._is_valid_image_url(src):
+                    continue
+                
+                alt = img.get('alt', '').strip()
+                
+                # Score the image
+                score = self._score_image(img, src, alt)
+                
+                if score > 0:
+                    candidate_images.append({
+                        'img': img,
+                        'src': src,
+                        'alt': alt,
+                        'score': score
+                    })
+        
+        # Return highest scoring image
+        if candidate_images:
+            best = max(candidate_images, key=lambda x: x['score'])
             
-        except Exception as e:
+            alt_text = best['alt'] if best['alt'] else self._get_context_alt_text(best['img'], soup)
+            
             return {
-                'error': str(e),
-                'source_url': article_url,
-                'error_type': type(e).__name__
+                'url': urljoin(article_url, best['src']),
+                'alt': alt_text[:150] if alt_text else 'Article image',
+                'source_url': article_url
             }
+        
+        return None
+    
+    def _get_image_src(self, img):
+        """Get image source from various attributes."""
+        # Try multiple source attributes
+        for attr in ['src', 'data-src', 'data-lazy-src', 'data-original', 'data-srcset']:
+            src = img.get(attr)
+            if src:
+                # Handle srcset format
+                if ',' in src:
+                    src = src.split(',')[0].strip().split()[0]
+                return src.strip()
+        
+        # Check srcset attribute
+        srcset = img.get('srcset')
+        if srcset:
+            # Get the largest image from srcset
+            sources = srcset.split(',')
+            if sources:
+                return sources[-1].strip().split()[0]
+        
+        return None
+    
+    def _is_valid_image_url(self, url):
+        """Quick validation for image URLs"""
+        if not url or len(url) < 10:
+            return False
+        
+        url_lower = url.lower()
+        
+        # Must be a valid image extension or contain image-like patterns
+        valid_extensions = ['.jpg', '.jpeg', '.png', '.webp', '.gif', '.svg']
+        has_valid_extension = any(ext in url_lower for ext in valid_extensions)
+        
+        # Or contains image-like patterns common in news sites
+        image_patterns = ['image', 'photo', 'picture', 'img', 'media', 'upload', 'content', 'asset']
+        has_image_pattern = any(pattern in url_lower for pattern in image_patterns)
+        
+        if not (has_valid_extension or has_image_pattern):
+            return False
+        
+        # Skip obvious non-content images
+        skip_patterns = [
+            'logo', 'icon', 'avatar', 'profile', 'placeholder',
+            'ad', 'banner', 'sponsor', 'promo', 'advertisement',
+            '1x1', 'pixel', 'tracking', 'beacon', 'spacer',
+            'button', 'badge', 'widget', 'social'
+        ]
+        
+        return not any(pattern in url_lower for pattern in skip_patterns)
+    
+    def _is_content_image(self, src, alt, img):
+        """Determine if image is likely article content."""
+        src_lower = src.lower()
+        alt_lower = alt.lower() if alt else ''
+        
+        # Skip tracking and ads
+        skip_terms = [
+            'pixel', 'tracking', '1x1', 'beacon', 'analytics',
+            'ad', 'banner', 'sponsor', 'advertisement',
+            'logo', 'icon', 'avatar', 'profile',
+            'facebook', 'twitter', 'instagram', 'social',
+            'share', 'button', 'widget'
+        ]
+        
+        if any(term in src_lower or term in alt_lower for term in skip_terms):
+            return False
+        
+        # Check image dimensions if available
+        width = img.get('width', '')
+        height = img.get('height', '')
+        
+        try:
+            if width and height:
+                w, h = int(width), int(height)
+                # Skip very small images
+                if w < 200 or h < 200:
+                    return False
+                # Skip tiny images (likely icons)
+                if w < 50 and h < 50:
+                    return False
+        except (ValueError, TypeError):
+            pass
+        
+        # Good indicators
+        good_patterns = ['article', 'content', 'story', 'post', 'featured', 'hero', 'main']
+        has_good_pattern = any(pattern in src_lower for pattern in good_patterns)
+        
+        # Meaningful alt text is a good sign
+        has_good_alt = alt and len(alt.strip()) > 10
+        
+        return has_good_pattern or has_good_alt
+    
+    def _score_image(self, img, src, alt):
+        """Score an image's likelihood of being the main article image."""
+        score = 0
+        
+        src_lower = src.lower()
+        alt_lower = alt.lower() if alt else ''
+        
+        # Positive indicators
+        if any(pattern in src_lower for pattern in ['hero', 'featured', 'main', 'lead']):
+            score += 10
+        
+        if any(pattern in src_lower for pattern in ['article', 'story', 'content', 'post']):
+            score += 5
+        
+        if alt and len(alt) > 20:
+            score += 5
+        
+        if alt and len(alt) > 50:
+            score += 3
+        
+        # Check position in page (earlier is better)
+        parent = img.find_parent()
+        if parent and parent.name in ['article', 'main']:
+            score += 5
+        
+        # Check for figure/picture elements (common for main images)
+        if img.find_parent(['figure', 'picture']):
+            score += 3
+        
+        # Negative indicators
+        if any(term in src_lower or term in alt_lower for term in ['logo', 'icon', 'avatar', 'ad', 'banner']):
+            score -= 20
+        
+        if '1x1' in src_lower or 'pixel' in src_lower:
+            score -= 20
+        
+        # Check dimensions
+        try:
+            width = int(img.get('width', 0))
+            height = int(img.get('height', 0))
+            
+            if width > 400 and height > 300:
+                score += 5
+            
+            if width < 100 or height < 100:
+                score -= 10
+        except (ValueError, TypeError):
+            pass
+        
+        return score
+    
+    def _get_context_alt_text(self, img, soup):
+        """Get alt text from surrounding context."""
+        # Try parent figure caption
+        figure = img.find_parent('figure')
+        if figure:
+            figcaption = figure.find('figcaption')
+            if figcaption:
+                return figcaption.get_text(strip=True)[:150]
+        
+        # Try nearby headings
+        parent = img.find_parent()
+        if parent:
+            heading = parent.find(['h1', 'h2', 'h3'])
+            if heading:
+                return heading.get_text(strip=True)[:150]
+        
+        # Try article title
+        og_title = soup.find('meta', property='og:title')
+        if og_title and og_title.get('content'):
+            return og_title['content'][:150]
+        
+        title = soup.find('title')
+        if title:
+            return title.get_text(strip=True)[:150]
+        
+        return 'Article image'
     
     def extract_images_from_group(self, similar_headlines, topic_name):
         """
         Improved image extraction with smarter source selection.
-        Prioritizes reliable news sources and uses fewer attempts.
+        Prioritizes reliable news sources and uses multiple attempts.
         """
-        # Prioritize major news sources (more likely to have good meta tags)
-        priority_sources = [
-            'Reuters', 'AP News', 'BBC', 'CNN', 'NPR', 'The Guardian', 
-            'Washington Post', 'New York Times', 'Wall Street Journal',
-            'TechCrunch', 'Ars Technica', 'The Verge', 'Wired'
+        # Tier 1: Major international news sources (most reliable)
+        tier1_sources = [
+            'Reuters', 'AP News', 'Associated Press', 'BBC', 'CNN', 'NPR', 
+            'The Guardian', 'Washington Post', 'New York Times', 'Wall Street Journal'
+        ]
+        
+        # Tier 2: Quality tech and news publications
+        tier2_sources = [
+            'TechCrunch', 'Ars Technica', 'The Verge', 'Wired', 'Axios',
+            'Bloomberg', 'CNBC', 'Financial Times', 'The Atlantic', 'Politico'
         ]
         
         # Group headlines by source
@@ -356,17 +692,22 @@ class BrutalistReportScraper:
                 headlines_by_source[source] = []
             headlines_by_source[source].append(headline)
         
-        # Sort sources by priority
+        # Build prioritized source list
         sources_to_try = []
         
-        # First, add priority sources if available
-        for priority_source in priority_sources:
+        # Add tier 1 sources first
+        for priority_source in tier1_sources:
             for source in headlines_by_source:
-                if priority_source.lower() in source.lower():
+                if priority_source.lower() in source.lower() and source not in sources_to_try:
                     sources_to_try.append(source)
-                    break
         
-        # Then add remaining sources
+        # Add tier 2 sources
+        for priority_source in tier2_sources:
+            for source in headlines_by_source:
+                if priority_source.lower() in source.lower() and source not in sources_to_try:
+                    sources_to_try.append(source)
+        
+        # Add remaining sources (shuffled for variety)
         remaining_sources = [s for s in headlines_by_source if s not in sources_to_try]
         import random
         random.shuffle(remaining_sources)
@@ -375,8 +716,8 @@ class BrutalistReportScraper:
         attempted_sources = []
         errors = []
         
-        # Try only 3 sources maximum for efficiency
-        for source in sources_to_try[:3]:
+        # Try up to 4 sources for better success rate
+        for source in sources_to_try[:4]:
             # Pick the first headline from this source (usually the most important)
             headline = headlines_by_source[source][0]
             attempted_sources.append(source)
@@ -407,57 +748,6 @@ class BrutalistReportScraper:
             'detailed_errors': errors,
             'total_attempts': len(attempted_sources)
         }
-    
-    def _is_valid_image_url(self, url):
-        """Quick validation for image URLs"""
-        if not url or len(url) < 10:
-            return False
-        
-        url_lower = url.lower()
-        
-        # Must be a valid image extension or contain image-like patterns
-        valid_extensions = ['.jpg', '.jpeg', '.png', '.webp', '.gif']
-        has_valid_extension = any(ext in url_lower for ext in valid_extensions)
-        
-        # Or contains image-like patterns common in news sites
-        image_patterns = ['image', 'photo', 'picture', 'img', 'media']
-        has_image_pattern = any(pattern in url_lower for pattern in image_patterns)
-        
-        if not (has_valid_extension or has_image_pattern):
-            return False
-        
-        # Skip obvious non-content images
-        skip_patterns = [
-            'logo', 'icon', 'avatar', 'profile', 'thumbnail',
-            'ad', 'banner', 'sponsor', 'promo',
-            '1x1', 'pixel', 'tracking', 'beacon'
-        ]
-        
-        return not any(pattern in url_lower for pattern in skip_patterns)
-    
-    def _is_likely_content_image(self, src, alt):
-        """
-        Simplified content image detection.
-        """
-        src_lower = src.lower()
-        alt_lower = alt.lower()
-        
-        # Skip tracking and ads
-        skip_terms = [
-            'pixel', 'tracking', '1x1', 'beacon', 'analytics',
-            'ad', 'banner', 'sponsor', 'promo',
-            'facebook', 'twitter', 'instagram', 'linkedin', 
-            'share', 'icon', 'logo', 'button'
-        ]
-        
-        if any(term in src_lower or term in alt_lower for term in skip_terms):
-            return False
-        
-        # Must have meaningful alt text
-        if len(alt.strip()) < 8:
-            return False
-        
-        return True
     # =====================================================================
     # END OF EXPERIMENTAL FEATURE
     # =====================================================================
